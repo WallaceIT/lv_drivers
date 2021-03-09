@@ -28,6 +28,8 @@
 #include <wayland-client.h>
 #include <xkbcommon/xkbcommon.h>
 
+#include "xdg-shell-client-protocol.h"
+
 /*********************
  *      DEFINES
  *********************/
@@ -82,6 +84,12 @@ struct application {
     struct wl_shell *shell;
     struct wl_shell_surface *shell_surface;
 
+    struct xdg_wm_base *xdg_shell;
+    struct xdg_surface *xdg_surface;
+    struct xdg_toplevel *xdg_toplevel;
+    bool wait_for_configure;
+    bool close_requested;
+
     int width;
     int height;
     uint32_t format;
@@ -108,6 +116,14 @@ static void shell_handle_ping(void *data, struct wl_shell_surface *shell_surface
 static void shell_handle_configure(void *data, struct wl_shell_surface *shell_surface,
                                    uint32_t edges, int32_t width, int32_t height);
 static void shell_handle_popup_done(void *data, struct wl_shell_surface *shell_surface);
+
+static void xdg_wm_base_ping(void *data, struct xdg_wm_base *shell, uint32_t serial);
+static void xdg_surface_handle_configure(void *data, struct xdg_surface *surface, uint32_t serial);
+static void xdg_toplevel_handle_configure(void *data, struct xdg_toplevel *toplevel,
+                                          int32_t width, int32_t height,
+                                          struct wl_array *states);
+static void xdg_toplevel_handle_close(void *data, struct xdg_toplevel *xdg_toplevel);
+
 static void seat_handle_capabilities(void *data, struct wl_seat *wl_seat, enum wl_seat_capability caps);
 
 static void pointer_handle_enter(void *data, struct wl_pointer *pointer,
@@ -166,6 +182,19 @@ static const struct wl_shell_surface_listener shell_surface_listener = {
     shell_handle_ping,
     shell_handle_configure,
     shell_handle_popup_done
+};
+
+static const struct xdg_wm_base_listener wm_base_listener = {
+    xdg_wm_base_ping,
+};
+
+static const struct xdg_surface_listener xdg_surface_listener = {
+    xdg_surface_handle_configure,
+};
+
+static const struct xdg_toplevel_listener xdg_toplevel_listener = {
+    xdg_toplevel_handle_configure,
+    xdg_toplevel_handle_close,
 };
 
 static const struct wl_seat_listener seat_listener = {
@@ -317,12 +346,27 @@ void wayland_init(void)
     wl_surface_set_user_data(application.surface, &application);
 
     // Create shell surface
-    application.shell_surface = wl_shell_get_shell_surface(application.shell, application.surface);
-    assert(application.shell_surface);
+    if (application.xdg_shell) {
+        application.xdg_surface = xdg_wm_base_get_xdg_surface(application.xdg_shell, application.surface);
+        assert(application.xdg_surface);
 
-    wl_shell_surface_add_listener(application.shell_surface, &shell_surface_listener, &application);
-    wl_shell_surface_set_toplevel(application.shell_surface);
-    wl_shell_surface_set_title(application.shell_surface, WAYLAND_SURF_TITLE);
+        xdg_surface_add_listener(application.xdg_surface, &xdg_surface_listener, &application);
+
+        application.xdg_toplevel = xdg_surface_get_toplevel(application.xdg_surface);
+        assert(application.xdg_toplevel);
+
+        xdg_toplevel_add_listener(application.xdg_toplevel, &xdg_toplevel_listener, &application);
+        xdg_toplevel_set_title(application.xdg_toplevel, WAYLAND_SURF_TITLE);
+
+        application.wait_for_configure = true;
+    } else if (application.shell) {
+        application.shell_surface = wl_shell_get_shell_surface(application.shell, application.surface);
+        assert(application.shell_surface);
+        
+        wl_shell_surface_add_listener(application.shell_surface, &shell_surface_listener, &application);
+        wl_shell_surface_set_toplevel(application.shell_surface);
+        wl_shell_surface_set_title(application.shell_surface, WAYLAND_SURF_TITLE);
+    }
 
     pthread_create(&application.thread, NULL, wayland_dispatch_handler, &application);
 }
@@ -338,6 +382,18 @@ void wayland_deinit(void)
 
     if (application.shm) {
         wl_shm_destroy(application.shm);
+    }
+
+    if (application.xdg_toplevel) {
+        xdg_toplevel_destroy(application.xdg_toplevel);
+    }
+
+    if (application.xdg_surface) {
+        xdg_surface_destroy(application.xdg_surface);
+    }
+
+    if (application.xdg_shell) {
+        xdg_wm_base_destroy(application.xdg_shell);
     }
 
     if (application.shell) {
@@ -406,6 +462,14 @@ void wayland_flush(lv_disp_drv_t * disp_drv, const lv_area_t * area, lv_color_t 
     wl_display_flush(application.display);
 
     lv_disp_flush_ready(disp_drv);
+}
+
+/**
+ * Check if close has been requested
+ */
+bool wayland_close_requested(void)
+{
+    return application.close_requested;
 }
 
 /**
@@ -494,6 +558,9 @@ static void handle_global(void *data, struct wl_registry *registry,
         app->seat.application = app;
         app->seat.wl_seat = wl_registry_bind(app->registry, name, &wl_seat_interface, 1);
         wl_seat_add_listener(app->seat.wl_seat, &seat_listener, &app->seat);
+    } else if (strcmp(interface, "xdg_wm_base") == 0) {
+        app->xdg_shell = wl_registry_bind(registry, name, &xdg_wm_base_interface, 1);
+        xdg_wm_base_add_listener(app->xdg_shell, &wm_base_listener, app);
     }
 }
 
@@ -546,6 +613,36 @@ static void shell_handle_configure(void *data, struct wl_shell_surface *shell_su
 
 static void shell_handle_popup_done(void *data, struct wl_shell_surface *shell_surface)
 {
+}
+
+static void xdg_wm_base_ping(void *data, struct xdg_wm_base *shell, uint32_t serial)
+{
+    xdg_wm_base_pong(shell, serial);
+}
+
+static void xdg_surface_handle_configure(void *data, struct xdg_surface *surface, uint32_t serial)
+{
+    struct application *app = data;
+
+    xdg_surface_ack_configure(surface, serial);
+
+    if (app->wait_for_configure) {
+        wl_display_flush(app->display);
+        app->wait_for_configure = false;
+    }
+}
+
+static void xdg_toplevel_handle_configure(void *data, struct xdg_toplevel *toplevel,
+                                          int32_t width, int32_t height,
+                                          struct wl_array *states)
+{
+}
+
+static void xdg_toplevel_handle_close(void *data, struct xdg_toplevel *xdg_toplevel)
+{
+    struct application *app = data;
+
+    app->close_requested = true;
 }
 
 static void seat_handle_capabilities(void *data, struct wl_seat *wl_seat, enum wl_seat_capability caps)
